@@ -8,12 +8,19 @@ import {
 	DurableObjectClassNames,
 	WORKER_BINDING_SERVICE_LOOPBACK,
 } from "../shared";
+import { WORKFLOWS_PLUGIN_NAME } from "../workflows";
 import {
 	getUserServiceName,
 	LOCAL_EXPLORER_DISK,
 	SERVICE_LOCAL_EXPLORER,
 } from "./constants";
 import type { BindingIdMap } from "./types";
+
+export interface WorkflowOptions {
+	name: string;
+	className: string;
+	scriptName?: string;
+}
 
 export interface ExplorerServicesOptions {
 	localExplorerUiPath: string;
@@ -59,6 +66,16 @@ export function getExplorerServices(
 		},
 	];
 
+	const hasWorkflows = Object.keys(bindingIdMap.workflows).length > 0;
+
+	if (hasDurableObjects || hasWorkflows) {
+		// Add loopback service binding if DOs or Workflows are configured
+		// The explorer worker uses this to call the /core/do-storage endpoint
+		// which reads the filesystem using Node.js (bypassing workerd disk service issues on Windows)
+		explorerBindings.push(WORKER_BINDING_SERVICE_LOOPBACK);
+	}
+
+
 	if (hasDurableObjects) {
 		// Add Durable Object namespace bindings for the explorer
 		// Yes we are binding to 'unbound' DOs, but that has no effect
@@ -69,6 +86,27 @@ export function getExplorerServices(
 				durableObjectNamespace: {
 					className: durableObject.className,
 					serviceName: getUserServiceName(durableObject.scriptName),
+				},
+			});
+		}
+	}
+
+	if (hasWorkflows) {
+		// Add workflow proxy bindings so the explorer can call .create(), .get(), etc.
+		for (const workflow of Object.values(bindingIdMap.workflows)) {
+			explorerBindings.push({
+				name: workflow.binding,
+				wrapped: {
+					moduleName: `${WORKFLOWS_PLUGIN_NAME}:local-wrapped-binding`,
+					innerBindings: [
+						{
+							name: "binding",
+							service: {
+								name: `${WORKFLOWS_PLUGIN_NAME}:${workflow.name}`,
+								entrypoint: "WorkflowBinding",
+							},
+						},
+					],
 				},
 			});
 		}
@@ -103,12 +141,14 @@ export function getExplorerServices(
  */
 export function constructExplorerBindingMap(
 	proxyBindings: Worker_Binding[],
-	durableObjectClassNames: DurableObjectClassNames
+	durableObjectClassNames: DurableObjectClassNames,
+	workflowBindings?: Record<string, WorkflowOptions>
 ): BindingIdMap {
 	const IDToBindingName: BindingIdMap = {
 		d1: {},
 		kv: {},
 		do: {},
+		workflows: {},
 	};
 
 	for (const binding of proxyBindings) {
@@ -159,6 +199,26 @@ export function constructExplorerBindingMap(
 				scriptName,
 				useSQLite: classInfo.enableSql ?? false,
 				binding: `EXPLORER_DO_${uniqueKey}`,
+			};
+		}
+	}
+
+	// Handle Workflow bindings
+	// Workflows use wrapped bindings with a service pointing to the workflow engine.
+	// The proxy binding name pattern is: "MINIFLARE_PROXY:workflows:{worker-name}:BINDING_NAME"
+	if (workflowBindings) {
+		for (const [bindingName, workflow] of Object.entries(workflowBindings)) {
+			// Find the proxy binding for this workflow
+			const proxyPrefix = `${CoreBindings.DURABLE_OBJECT_NAMESPACE_PROXY}:${WORKFLOWS_PLUGIN_NAME}:`;
+			const proxyBinding = proxyBindings.find(
+				(b) => b.name?.startsWith(proxyPrefix) && b.name?.endsWith(`:${bindingName}`)
+			);
+
+			IDToBindingName.workflows[workflow.name] = {
+				name: workflow.name,
+				className: workflow.className,
+				scriptName: workflow.scriptName ?? "",
+				binding: proxyBinding?.name ?? bindingName,
 			};
 		}
 	}

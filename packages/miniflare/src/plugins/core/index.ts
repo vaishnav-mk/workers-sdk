@@ -63,7 +63,9 @@ import {
 	constructExplorerBindingMap,
 	getExplorerServices,
 	wrapDurableObjectModules,
+	type WorkflowOptions,
 } from "./explorer";
+export type { WorkflowOptions } from "./explorer";
 import {
 	buildStringScriptPath,
 	convertModuleDefinition,
@@ -997,6 +999,8 @@ export interface GlobalServicesOptions {
 	proxyBindings: Worker_Binding[];
 	/** Pass Durable Object configuration for the explorer worker (has more info than proxyBindings)*/
 	durableObjectClassNames: DurableObjectClassNames;
+	/** Workflow binding configurations for the explorer worker */
+	workflowBindings?: Record<string, WorkflowOptions>;
 }
 export function getGlobalServices({
 	sharedOptions,
@@ -1006,6 +1010,7 @@ export function getGlobalServices({
 	log,
 	proxyBindings,
 	durableObjectClassNames,
+	workflowBindings,
 }: GlobalServicesOptions): Service[] {
 	// Collect list of workers we could route to, then parse and sort all routes
 	const workerNames = [...allWorkerRoutes.keys()];
@@ -1140,7 +1145,8 @@ export function getGlobalServices({
 		}
 		const IDToBindingMap: BindingIdMap = constructExplorerBindingMap(
 			proxyBindings,
-			durableObjectClassNames
+			durableObjectClassNames,
+			workflowBindings
 		);
 		const hasDurableObjects = Object.keys(IDToBindingMap.do).length > 0;
 		services.push(

@@ -43,6 +43,7 @@ import {
 	D1_PLUGIN_NAME,
 	DURABLE_OBJECTS_PLUGIN_NAME,
 	DurableObjectClassNames,
+	WORKFLOWS_PLUGIN_NAME,
 	getDirectSocketName,
 	getGlobalServices,
 	getPersistPath,
@@ -903,6 +904,14 @@ export function _initialiseInstanceRegistry() {
 	return (maybeInstanceRegistry = new Map());
 }
 
+function tryParseJSON(str: string): unknown {
+	try {
+		return JSON.parse(str);
+	} catch {
+		return str;
+	}
+}
+
 export class Miniflare {
 	#previousSharedOpts?: PluginSharedOptions;
 	#previousWorkerOpts?: PluginWorkerOptions[];
@@ -1219,6 +1228,232 @@ export class Miniflare {
 		}
 	}
 
+	/**
+	 * Reads workflow instance data directly from the Engine DO's SQLite files.
+	 *
+	 * @param url in format: /core/workflow-storage/<namespaceUniqueKey>/instances
+	 * @returns Array of instance objects with their states
+	 */
+	async #handleLoopbackWorkflowStorageRequest(url: URL): Promise<Response> {
+		// Extract the unique key from the path
+		// e.g., "/core/workflow-storage/miniflare-workflows-order-pipeline/instances"
+		const pathAfterPrefix = url.pathname.slice(
+			"/core/workflow-storage/".length
+		);
+		const uniqueKey = decodeURIComponent(
+			pathAfterPrefix.replace(/\/instances$/, "")
+		);
+		assert(uniqueKey, "Workflow unique key is required");
+
+		const workflowSharedOpts = this.#sharedOpts.workflows;
+		const coreSharedOpts = this.#sharedOpts.core;
+		const workflowPersistPath = getPersistPath(
+			WORKFLOWS_PLUGIN_NAME,
+			this.#tmpPath,
+			coreSharedOpts.defaultPersistRoot,
+			workflowSharedOpts.workflowsPersist
+		);
+
+		const namespacePath = path.join(workflowPersistPath, uniqueKey);
+
+		// Path traversal check
+		if (
+			!namespacePath.startsWith(path.resolve(workflowPersistPath) + path.sep)
+		) {
+			return new Response("Invalid workflow key", { status: 400 });
+		}
+
+		let dirEntries: fs.Dirent[];
+		try {
+			dirEntries = await fs.promises.readdir(namespacePath, {
+				withFileTypes: true,
+			});
+		} catch (e) {
+			if (isFileNotFoundError(e)) {
+				return new Response("Not Found", { status: 404 });
+			}
+			throw e;
+		}
+
+		const sqliteFiles = dirEntries
+			.filter((entry) => entry.isFile() && entry.name.endsWith(".sqlite"))
+			.map((entry) => entry.name);
+
+		if (sqliteFiles.length === 0) {
+			return Response.json([]);
+		}
+
+		// Dynamically import node:sqlite (available in Node 22.5+)
+		// Use a variable to prevent TypeScript from resolving the module
+		let DatabaseClass: any;
+		try {
+			const moduleName = "node:sqlite";
+			const sqliteModule: any = await import(/* webpackIgnore: true */ moduleName);
+			DatabaseClass = sqliteModule.DatabaseSync;
+		} catch {
+			return Response.json(
+				{
+					error:
+						"node:sqlite is not available. Node.js >= 22.5 is required for workflow instance inspection.",
+				},
+				{ status: 501 }
+			);
+		}
+
+		const instances: Array<{
+			hash: string;
+			id: string;
+			status: string;
+			output: unknown;
+			error: unknown;
+			params: unknown;
+			created_on: string | null;
+			states: Array<{
+				id: number;
+				event: number;
+				groupKey: string | null;
+				target: string | null;
+				metadata: unknown;
+			}>;
+		}> = [];
+
+		for (const file of sqliteFiles) {
+			const hash = file.replace(/\.sqlite$/, "");
+			const dbPath = path.join(namespacePath, file);
+
+			try {
+				const db = new DatabaseClass(dbPath, { readOnly: true });
+
+				// Read states table (the event log)
+				let states: Array<{
+					id: number;
+					event: number;
+					groupKey: string | null;
+					target: string | null;
+					metadata: unknown;
+				}> = [];
+
+				try {
+					const rows = db
+						.prepare(
+							"SELECT id, event, groupKey, target, metadata FROM states ORDER BY id ASC"
+						)
+						.all() as Array<{
+						id: number;
+						event: number;
+						groupKey: string | null;
+						target: string | null;
+						metadata: string | null;
+					}>;
+
+					states = rows.map((row) => ({
+						id: row.id,
+						event: row.event,
+						groupKey: row.groupKey,
+						target: row.target,
+						metadata: row.metadata ? tryParseJSON(row.metadata) : null,
+					}));
+				} catch {
+					// states table might not exist yet
+				}
+
+				// Read instance metadata from _cf_KV table
+				// The Engine DO stores instance info as V8-serialized blobs
+				let instanceId = hash;
+				let instanceStatus = "unknown";
+				let output: unknown = null;
+				let error: unknown = null;
+				let params: unknown = null;
+				let createdOn: string | null = null;
+
+				// Derive status from states events
+				const lastEvent = states.length > 0 ? states[states.length - 1] : null;
+				if (lastEvent) {
+					switch (lastEvent.event) {
+						case 0: // WORKFLOW_QUEUED
+							instanceStatus = "queued";
+							break;
+						case 1: // WORKFLOW_START
+							instanceStatus = "running";
+							break;
+						case 2: // WORKFLOW_SUCCESS
+							instanceStatus = "complete";
+							output = (lastEvent.metadata as Record<string, unknown>)?.result ?? null;
+							break;
+						case 3: // WORKFLOW_FAILURE
+							instanceStatus = "errored";
+							error = (lastEvent.metadata as Record<string, unknown>)?.error ?? null;
+							break;
+						case 4: // WORKFLOW_TERMINATED
+							instanceStatus = "terminated";
+							break;
+						default:
+							instanceStatus = "running";
+					}
+				}
+
+				// Extract the real instance UUID and timestamp from INSTANCE_METADATA
+				// This is V8-serialized and contains { instance: { id: "uuid" }, event: { timestamp, payload } }
+				try {
+					const metaRow = db
+						.prepare("SELECT value FROM _cf_KV WHERE key = 'INSTANCE_METADATA'")
+						.get() as { value: Buffer } | undefined;
+					if (metaRow?.value) {
+						const v8 = await import("node:v8");
+						const metaData = v8.deserialize(Buffer.from(metaRow.value)) as {
+							instance?: { id?: string };
+							event?: { timestamp?: string; payload?: unknown; instanceId?: string };
+						};
+						if (metaData.instance?.id) {
+							instanceId = metaData.instance.id;
+						}
+						if (metaData.event?.timestamp) {
+							createdOn = metaData.event.timestamp;
+						}
+					}
+				} catch {
+					// V8 deserialization may fail on some blobs
+				}
+
+				// Get params from the queued event metadata
+				const queuedEvent = states.find((s) => s.event === 0);
+				if (queuedEvent && queuedEvent.metadata) {
+					const meta = queuedEvent.metadata as Record<string, unknown>;
+					if (meta.params !== undefined) {
+						params = meta.params;
+					}
+				}
+
+				db.close();
+
+				instances.push({
+					hash,
+					id: instanceId,
+					status: instanceStatus,
+					output,
+					error,
+					params,
+					created_on: createdOn,
+					states,
+				});
+			} catch {
+				// Skip unreadable files
+				instances.push({
+					hash,
+					id: hash,
+					status: "unknown",
+					output: null,
+					error: null,
+					params: null,
+					created_on: null,
+					states: [],
+				});
+			}
+		}
+
+		return Response.json(instances);
+	}
+
 	get #workerSrcOpts(): NameSourceOptions[] {
 		return this.#workerOpts.map<NameSourceOptions>(({ core }) => core);
 	}
@@ -1352,6 +1587,12 @@ export class Miniflare {
 				const registryPath = this.#devRegistry.getRegistryPath();
 				const registry = registryPath ? getWorkerRegistry(registryPath) : {};
 				response = Response.json(registry);
+			} else if (
+				url.pathname.startsWith("/core/workflow-storage/") &&
+				url.pathname.endsWith("/instances")
+			) {
+				response =
+					await this.#handleLoopbackWorkflowStorageRequest(url);
 			}
 		} catch (e: any) {
 			this.#log.error(e);
@@ -1980,6 +2221,7 @@ export class Miniflare {
 			log: this.#log,
 			proxyBindings,
 			durableObjectClassNames,
+			workflowBindings: this.#workerOpts[0].workflows.workflows,
 		});
 		for (const service of globalServices) {
 			// Global services should all have unique names

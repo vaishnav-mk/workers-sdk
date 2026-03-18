@@ -8,21 +8,25 @@ import {
 	durableObjectsNamespaceListNamespaces,
 	workersKvNamespaceListNamespaces,
 } from "../api";
+import { listWorkflows } from "../api/workflows";
 import { Sidebar } from "../components/Sidebar";
 import type {
 	D1DatabaseResponse,
 	WorkersKvNamespace,
 	WorkersNamespace,
 } from "../api";
+import type { WorkflowDefinition } from "../api/workflows";
 
 export const Route = createRootRoute({
 	component: RootLayout,
 	loader: async () => {
-		const [kvResponse, d1Response, doResponse] = await Promise.allSettled([
-			workersKvNamespaceListNamespaces(),
-			d1ListDatabases(),
-			durableObjectsNamespaceListNamespaces(),
-		]);
+		const [kvResponse, d1Response, doResponse, workflowsResponse] =
+			await Promise.allSettled([
+				workersKvNamespaceListNamespaces(),
+				d1ListDatabases(),
+				durableObjectsNamespaceListNamespaces(),
+				listWorkflows(),
+			]);
 
 		let kvNamespaces = new Array<WorkersKvNamespace>();
 		let kvError: string | null = null;
@@ -50,6 +54,14 @@ export const Route = createRootRoute({
 			doError = `DO Error: ${doResponse.reason instanceof Error ? doResponse.reason.message : JSON.stringify(doResponse.reason)}`;
 		}
 
+		let workflows = new Array<WorkflowDefinition>();
+		let workflowsError: string | null = null;
+		if (workflowsResponse.status === "fulfilled") {
+			workflows = workflowsResponse.value;
+		} else {
+			workflowsError = `Workflows Error: ${workflowsResponse.reason instanceof Error ? workflowsResponse.reason.message : JSON.stringify(workflowsResponse.reason)}`;
+		}
+
 		return {
 			d1Error,
 			databases,
@@ -57,6 +69,8 @@ export const Route = createRootRoute({
 			doNamespaces,
 			kvError,
 			kvNamespaces,
+			workflows,
+			workflowsError,
 		};
 	},
 });
@@ -76,6 +90,8 @@ function RootLayout() {
 				doNamespaces={loaderData.doNamespaces}
 				kvError={loaderData.kvError}
 				kvNamespaces={loaderData.kvNamespaces}
+				workflows={loaderData.workflows}
+				workflowsError={loaderData.workflowsError}
 			/>
 			<main className="flex flex-1 flex-col overflow-y-auto">
 				<Outlet />

@@ -1,6 +1,9 @@
 import { CloudflareLogo, cn } from "@cloudflare/kumo";
 import { Collapsible } from "@cloudflare/kumo/primitives/collapsible";
-import { CaretRightIcon } from "@phosphor-icons/react";
+import {
+	CaretRightIcon,
+	GitBranchIcon,
+} from "@phosphor-icons/react";
 import { Link } from "@tanstack/react-router";
 import D1Icon from "../assets/icons/d1.svg?react";
 import DOIcon from "../assets/icons/durable-objects.svg?react";
@@ -10,6 +13,7 @@ import type {
 	WorkersKvNamespace,
 	WorkersNamespace,
 } from "../api";
+import type { WorkflowDefinition } from "../api/workflows";
 import type { FileRouteTypes } from "../routeTree.gen";
 import type { FC } from "react";
 
@@ -93,6 +97,8 @@ interface SidebarProps {
 	doNamespaces: WorkersNamespace[];
 	kvError: string | null;
 	kvNamespaces: WorkersKvNamespace[];
+	workflows: WorkflowDefinition[];
+	workflowsError: string | null;
 }
 
 export function Sidebar({
@@ -103,6 +109,8 @@ export function Sidebar({
 	doNamespaces,
 	kvError,
 	kvNamespaces,
+	workflows,
+	workflowsError,
 }: SidebarProps) {
 	return (
 		<aside className="flex w-sidebar flex-col border-r border-border bg-bg-secondary">
@@ -173,6 +181,24 @@ export function Sidebar({
 					};
 				})}
 				title="Durable Objects"
+			/>
+
+			<SidebarItemGroup
+				emptyLabel="No workflows"
+				error={workflowsError}
+				icon={GitBranchIcon}
+				items={workflows.map((wf) => ({
+					id: wf.name,
+					isActive:
+						currentPath === `/workflows/${wf.name}` ||
+						currentPath.startsWith(`/workflows/${wf.name}/`),
+					label: wf.name,
+					link: {
+						params: { workflowName: wf.name },
+						to: "/workflows/$workflowName" as FileRouteTypes["to"],
+					},
+				}))}
+				title="Workflows"
 			/>
 		</aside>
 	);

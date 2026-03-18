@@ -186,6 +186,7 @@ export type {
 	GlobalServicesOptions,
 	SourceOptions,
 	NodeJSCompatMode,
+	WorkflowOptions,
 } from "./core";
 export type * from "./core/proxy/types";
 export * from "./d1";

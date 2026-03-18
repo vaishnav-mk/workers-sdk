@@ -148,6 +148,9 @@ export class Engine extends DurableObject<Env> {
 			JSON.stringify(metadata)
 		);
 
+		// Wake log watcher (for SSE streaming)
+		this.wakeLogWatcher();
+
 		// Wake any waiters if this is a terminal step event
 		if (group) {
 			this.handleStepResultWaiter(group, event, metadata);
@@ -199,6 +202,91 @@ export class Engine extends DurableObject<Env> {
 		};
 	}
 
+	/**
+	 * Watch for log changes. Returns all logs with id > afterRowId.
+	 * If no new logs exist, blocks until the next writeLog() call.
+	 * Returns the logs, current status, and the last row ID for
+	 * the caller to pass back on the next invocation.
+	 */
+	async watchLogs(afterRowId: number): Promise<{
+		logs: Log[];
+		status: string;
+		lastRowId: number;
+	}> {
+		// Check for new logs since afterRowId
+		const newLogs = this.readLogsAfter(afterRowId);
+
+		if (newLogs.logs.length > 0) {
+			// New logs exist — return immediately
+			const status = await this.getStatus();
+			return {
+				logs: newLogs.logs,
+				status: instanceStatusName(status),
+				lastRowId: newLogs.lastRowId,
+			};
+		}
+
+		// No new logs — wait for the next writeLog() call
+		await new Promise<void>((resolve, reject) => {
+			this.logWatcher = {
+				resolve: () => resolve(),
+				reject,
+			};
+		});
+
+		// writeLog fired — read the new logs
+		const freshLogs = this.readLogsAfter(afterRowId);
+		const status = await this.getStatus();
+		return {
+			logs: freshLogs.logs,
+			status: instanceStatusName(status),
+			lastRowId: freshLogs.lastRowId,
+		};
+	}
+
+	/**
+	 * Read all logs with id > afterRowId.
+	 */
+	private readLogsAfter(afterRowId: number): {
+		logs: Log[];
+		lastRowId: number;
+	} {
+		const rows = [
+			...this.ctx.storage.sql.exec<{
+				id: number;
+				event: InstanceEvent;
+				groupKey: string | null;
+				target: string | null;
+				metadata: string;
+			}>(
+				"SELECT id, event, groupKey, target, metadata FROM states WHERE id > ? ORDER BY id ASC",
+				afterRowId
+			),
+		];
+
+		const logs = rows.map((row) => ({
+			event: row.event,
+			group: row.groupKey,
+			target: row.target,
+			metadata: JSON.parse(row.metadata),
+		}));
+
+		const lastRowId =
+			rows.length > 0 ? rows[rows.length - 1].id : afterRowId;
+
+		return { logs, lastRowId };
+	}
+
+	/**
+	 * Wake the log watcher (if any) — called from writeLog.
+	 */
+	private wakeLogWatcher(): void {
+		if (this.logWatcher) {
+			this.logWatcher.resolve(undefined);
+			this.logWatcher = undefined;
+		}
+	}
+
 	async getStatus(): Promise<InstanceStatus> {
 		if (this.accountId === undefined) {
 			// Engine could have restarted, so we try to restore from its state
@@ -232,6 +320,15 @@ export class Engine extends DurableObject<Env> {
 
 		// check if anyone is waiting for this status
 		this.handleStatusWaiter(status);
+
+		// Wake log watcher on terminal status so SSE streams can close
+		if (
+			status === InstanceStatus.Complete ||
+			status === InstanceStatus.Errored ||
+			status === InstanceStatus.Terminated
+		) {
+			this.wakeLogWatcher();
+		}
 	}
 
 	private statusWaiters: Map<
@@ -321,6 +418,11 @@ export class Engine extends DurableObject<Env> {
 			}
 		}
 	}
+
+	// Watcher for streaming log changes (used by local explorer SSE)
+	private logWatcher:
+		| { resolve: (v: unknown) => void; reject: (e: unknown) => void }
+		| undefined;
 
 	private stepResultWaiters: Map<
 		string,

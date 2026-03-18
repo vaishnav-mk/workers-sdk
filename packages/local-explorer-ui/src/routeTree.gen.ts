@@ -10,15 +10,23 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as WorkflowsWorkflowNameRouteImport } from './routes/workflows/$workflowName'
 import { Route as KvNamespaceIdRouteImport } from './routes/kv/$namespaceId'
 import { Route as DoClassNameRouteImport } from './routes/do/$className'
 import { Route as D1DatabaseIdRouteImport } from './routes/d1/$databaseId'
+import { Route as WorkflowsWorkflowNameIndexRouteImport } from './routes/workflows/$workflowName/index'
 import { Route as DoClassNameIndexRouteImport } from './routes/do/$className/index'
+import { Route as WorkflowsWorkflowNameInstanceIdRouteImport } from './routes/workflows/$workflowName/$instanceId'
 import { Route as DoClassNameObjectIdRouteImport } from './routes/do/$className/$objectId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const WorkflowsWorkflowNameRoute = WorkflowsWorkflowNameRouteImport.update({
+  id: '/workflows/$workflowName',
+  path: '/workflows/$workflowName',
   getParentRoute: () => rootRouteImport,
 } as any)
 const KvNamespaceIdRoute = KvNamespaceIdRouteImport.update({
@@ -36,11 +44,23 @@ const D1DatabaseIdRoute = D1DatabaseIdRouteImport.update({
   path: '/d1/$databaseId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WorkflowsWorkflowNameIndexRoute =
+  WorkflowsWorkflowNameIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => WorkflowsWorkflowNameRoute,
+  } as any)
 const DoClassNameIndexRoute = DoClassNameIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => DoClassNameRoute,
 } as any)
+const WorkflowsWorkflowNameInstanceIdRoute =
+  WorkflowsWorkflowNameInstanceIdRouteImport.update({
+    id: '/$instanceId',
+    path: '/$instanceId',
+    getParentRoute: () => WorkflowsWorkflowNameRoute,
+  } as any)
 const DoClassNameObjectIdRoute = DoClassNameObjectIdRouteImport.update({
   id: '/$objectId',
   path: '/$objectId',
@@ -52,15 +72,20 @@ export interface FileRoutesByFullPath {
   '/d1/$databaseId': typeof D1DatabaseIdRoute
   '/do/$className': typeof DoClassNameRouteWithChildren
   '/kv/$namespaceId': typeof KvNamespaceIdRoute
+  '/workflows/$workflowName': typeof WorkflowsWorkflowNameRouteWithChildren
   '/do/$className/$objectId': typeof DoClassNameObjectIdRoute
+  '/workflows/$workflowName/$instanceId': typeof WorkflowsWorkflowNameInstanceIdRoute
   '/do/$className/': typeof DoClassNameIndexRoute
+  '/workflows/$workflowName/': typeof WorkflowsWorkflowNameIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/d1/$databaseId': typeof D1DatabaseIdRoute
   '/kv/$namespaceId': typeof KvNamespaceIdRoute
   '/do/$className/$objectId': typeof DoClassNameObjectIdRoute
+  '/workflows/$workflowName/$instanceId': typeof WorkflowsWorkflowNameInstanceIdRoute
   '/do/$className': typeof DoClassNameIndexRoute
+  '/workflows/$workflowName': typeof WorkflowsWorkflowNameIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -68,8 +93,11 @@ export interface FileRoutesById {
   '/d1/$databaseId': typeof D1DatabaseIdRoute
   '/do/$className': typeof DoClassNameRouteWithChildren
   '/kv/$namespaceId': typeof KvNamespaceIdRoute
+  '/workflows/$workflowName': typeof WorkflowsWorkflowNameRouteWithChildren
   '/do/$className/$objectId': typeof DoClassNameObjectIdRoute
+  '/workflows/$workflowName/$instanceId': typeof WorkflowsWorkflowNameInstanceIdRoute
   '/do/$className/': typeof DoClassNameIndexRoute
+  '/workflows/$workflowName/': typeof WorkflowsWorkflowNameIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -78,23 +106,31 @@ export interface FileRouteTypes {
     | '/d1/$databaseId'
     | '/do/$className'
     | '/kv/$namespaceId'
+    | '/workflows/$workflowName'
     | '/do/$className/$objectId'
+    | '/workflows/$workflowName/$instanceId'
     | '/do/$className/'
+    | '/workflows/$workflowName/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/d1/$databaseId'
     | '/kv/$namespaceId'
     | '/do/$className/$objectId'
+    | '/workflows/$workflowName/$instanceId'
     | '/do/$className'
+    | '/workflows/$workflowName'
   id:
     | '__root__'
     | '/'
     | '/d1/$databaseId'
     | '/do/$className'
     | '/kv/$namespaceId'
+    | '/workflows/$workflowName'
     | '/do/$className/$objectId'
+    | '/workflows/$workflowName/$instanceId'
     | '/do/$className/'
+    | '/workflows/$workflowName/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -102,6 +138,7 @@ export interface RootRouteChildren {
   D1DatabaseIdRoute: typeof D1DatabaseIdRoute
   DoClassNameRoute: typeof DoClassNameRouteWithChildren
   KvNamespaceIdRoute: typeof KvNamespaceIdRoute
+  WorkflowsWorkflowNameRoute: typeof WorkflowsWorkflowNameRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
@@ -111,6 +148,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/workflows/$workflowName': {
+      id: '/workflows/$workflowName'
+      path: '/workflows/$workflowName'
+      fullPath: '/workflows/$workflowName'
+      preLoaderRoute: typeof WorkflowsWorkflowNameRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/kv/$namespaceId': {
@@ -134,12 +178,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof D1DatabaseIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/workflows/$workflowName/': {
+      id: '/workflows/$workflowName/'
+      path: '/'
+      fullPath: '/workflows/$workflowName/'
+      preLoaderRoute: typeof WorkflowsWorkflowNameIndexRouteImport
+      parentRoute: typeof WorkflowsWorkflowNameRoute
+    }
     '/do/$className/': {
       id: '/do/$className/'
       path: '/'
       fullPath: '/do/$className/'
       preLoaderRoute: typeof DoClassNameIndexRouteImport
       parentRoute: typeof DoClassNameRoute
+    }
+    '/workflows/$workflowName/$instanceId': {
+      id: '/workflows/$workflowName/$instanceId'
+      path: '/$instanceId'
+      fullPath: '/workflows/$workflowName/$instanceId'
+      preLoaderRoute: typeof WorkflowsWorkflowNameInstanceIdRouteImport
+      parentRoute: typeof WorkflowsWorkflowNameRoute
     }
     '/do/$className/$objectId': {
       id: '/do/$className/$objectId'
@@ -165,11 +223,27 @@ const DoClassNameRouteWithChildren = DoClassNameRoute._addFileChildren(
   DoClassNameRouteChildren,
 )
 
+interface WorkflowsWorkflowNameRouteChildren {
+  WorkflowsWorkflowNameInstanceIdRoute: typeof WorkflowsWorkflowNameInstanceIdRoute
+  WorkflowsWorkflowNameIndexRoute: typeof WorkflowsWorkflowNameIndexRoute
+}
+
+const WorkflowsWorkflowNameRouteChildren: WorkflowsWorkflowNameRouteChildren = {
+  WorkflowsWorkflowNameInstanceIdRoute: WorkflowsWorkflowNameInstanceIdRoute,
+  WorkflowsWorkflowNameIndexRoute: WorkflowsWorkflowNameIndexRoute,
+}
+
+const WorkflowsWorkflowNameRouteWithChildren =
+  WorkflowsWorkflowNameRoute._addFileChildren(
+    WorkflowsWorkflowNameRouteChildren,
+  )
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   D1DatabaseIdRoute: D1DatabaseIdRoute,
   DoClassNameRoute: DoClassNameRouteWithChildren,
   KvNamespaceIdRoute: KvNamespaceIdRoute,
+  WorkflowsWorkflowNameRoute: WorkflowsWorkflowNameRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

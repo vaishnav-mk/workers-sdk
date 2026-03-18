@@ -28,6 +28,15 @@ import {
 	listKVNamespaces,
 	putKVValue,
 } from "./resources/kv";
+import {
+	getWorkflowInstance,
+	getWorkflowInstanceStatus,
+	listWorkflowInstances,
+	listWorkflows,
+	sendWorkflowEvent,
+	streamWorkflowInstance,
+	triggerWorkflow,
+} from "./resources/workflows";
 import type { BindingIdMap } from "../../plugins/core/types";
 
 export type Env = {
@@ -209,6 +218,64 @@ app.post(
 	"/api/workers/durable_objects/namespaces/:namespace_id/query",
 	validateRequestBody(zDurableObjectsNamespaceQuerySqliteData.shape.body),
 	(c) => queryDOSqlite(c, c.req.param("namespace_id"), c.req.valid("json"))
+);
+
+// ============================================================================
+// Workflow Endpoints
+// ============================================================================
+
+app.get("/api/workflows", (c) => listWorkflows(c));
+
+app.get("/api/workflows/:workflow_name/instances", (c) =>
+	listWorkflowInstances(c, c.req.param("workflow_name"))
+);
+
+app.get(
+	"/api/workflows/:workflow_name/instances/:instance_id",
+	(c) =>
+		getWorkflowInstance(
+			c,
+			c.req.param("workflow_name"),
+			c.req.param("instance_id")
+		)
+);
+
+app.get(
+	"/api/workflows/:workflow_name/instances/:instance_id/status",
+	(c) =>
+		getWorkflowInstanceStatus(
+			c,
+			c.req.param("workflow_name"),
+			c.req.param("instance_id")
+		)
+);
+
+app.get(
+	"/api/workflows/:workflow_name/instances/:instance_id/stream",
+	(c) =>
+		streamWorkflowInstance(
+			c,
+			c.req.param("workflow_name"),
+			c.req.param("instance_id")
+		)
+);
+
+app.post("/api/workflows/:workflow_name/trigger", async (c) => {
+	const body = await c.req.json<{ id?: string; params?: unknown }>();
+	return triggerWorkflow(c, c.req.param("workflow_name"), body);
+});
+
+app.post(
+	"/api/workflows/:workflow_name/instances/:instance_id/events",
+	async (c) => {
+		const body = await c.req.json<{ type: string; payload: unknown }>();
+		return sendWorkflowEvent(
+			c,
+			c.req.param("workflow_name"),
+			c.req.param("instance_id"),
+			body
+		);
+	}
 );
 
 export default app;

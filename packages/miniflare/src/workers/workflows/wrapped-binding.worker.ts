@@ -61,6 +61,22 @@ class WorkflowImpl implements Workflow {
 	): Promise<unknown> {
 		return this.binding.unsafeGetOutputOrError(instanceId, isOutput);
 	}
+
+	async unsafeWatchLogs(
+		instanceId: string,
+		afterRowId: number
+	): Promise<{
+		logs: Array<{
+			event: number;
+			group: string | null;
+			target: string | null;
+			metadata: unknown;
+		}>;
+		status: string;
+		lastRowId: number;
+	}> {
+		return this.binding.unsafeWatchLogs(instanceId, afterRowId);
+	}
 }
 
 class InstanceImpl implements WorkflowInstance {
