@@ -11,6 +11,8 @@ declare namespace Cloudflare {
 		DB: D1Database;
 		BACKUP_DB: D1Database;
 		DO: DurableObjectNamespace<import("./src/index").MyDurableObject>;
+		KITCHEN_SINK: Workflow;
+		ERROR_RECOVERY: Workflow;
 	}
 }
 interface Env extends Cloudflare.Env {}

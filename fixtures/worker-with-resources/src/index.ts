@@ -1,4 +1,139 @@
-import { DurableObject } from "cloudflare:workers";
+import {
+	DurableObject,
+	WorkflowEntrypoint,
+	WorkflowEvent,
+	WorkflowStep,
+} from "cloudflare:workers";
+
+// ─── Kitchen Sink Workflow ───────────────────────────────────────────────────
+// Exercises every step type: do, do+retries, looped do, sleep, waitForEvent.
+// Blocks at "approval-gate" so you can test the Send Event UI in the explorer.
+export class KitchenSink extends WorkflowEntrypoint<Env> {
+	async run(event: WorkflowEvent<{ label?: string }>, step: WorkflowStep) {
+		const config = await step.do("load-config", async () => {
+			return {
+				label: event.payload?.label ?? "default-run",
+				startedAt: new Date().toISOString(),
+				features: ["retries", "sleep", "waitForEvent", "loops"],
+			};
+		});
+
+		const validated = await step.do(
+			"validate-input",
+			{
+				retries: { limit: 3, delay: "2 seconds", backoff: "exponential" },
+				timeout: "30 seconds",
+			},
+			async () => {
+				return {
+					valid: true,
+					label: config.label,
+					checkedAt: new Date().toISOString(),
+				};
+			}
+		);
+
+		const batchResults: Array<{ id: number; processed: boolean; ts: string }> =
+			[];
+		for (let i = 0; i < 4; i++) {
+			const result = await step.do(`process-batch-${i}`, async () => {
+				return { id: i, processed: true, ts: new Date().toISOString() };
+			});
+			batchResults.push(result);
+		}
+
+		await step.sleep("rate-limit-cooldown", "3 seconds");
+
+		const report = await step.do("generate-report", async () => {
+			return {
+				summary: {
+					total: batchResults.length,
+					successful: batchResults.filter((b) => b.processed).length,
+					label: validated.label,
+				},
+				batches: batchResults,
+				metadata: {
+					generatedAt: new Date().toISOString(),
+					version: "2.1.0",
+					tags: ["test", "kitchen-sink", "explorer-ui"],
+				},
+			};
+		});
+
+		// This step blocks — use the explorer UI "Send Event" button to continue
+		const approval = await step.waitForEvent<{
+			approved: boolean;
+			reviewer: string;
+			notes?: string;
+		}>("approval-gate", {
+			type: "approval_decision",
+			timeout: "1 hour",
+		});
+
+		const finalAction = await step.do("apply-decision", async () => {
+			if (approval.payload?.approved) {
+				return {
+					action: "approved",
+					reviewer: approval.payload.reviewer,
+					notes: approval.payload.notes ?? "No notes",
+					appliedAt: new Date().toISOString(),
+				};
+			}
+			return {
+				action: "rejected",
+				reviewer: approval.payload?.reviewer ?? "unknown",
+				notes: approval.payload?.notes ?? "Rejected",
+				appliedAt: new Date().toISOString(),
+			};
+		});
+
+		await step.sleep("final-cooldown", "1 second");
+
+		return await step.do("finalize", async () => {
+			return {
+				label: config.label,
+				startedAt: config.startedAt,
+				batchesProcessed: report.summary.total,
+				decision: finalAction.action,
+				reviewer: finalAction.reviewer,
+				completedAt: new Date().toISOString(),
+			};
+		});
+	}
+}
+
+// ─── Error Recovery Workflow ─────────────────────────────────────────────────
+// The "risky" step fails if shouldFail=true. Useful for testing error states.
+export class ErrorRecovery extends WorkflowEntrypoint<Env> {
+	async run(
+		event: WorkflowEvent<{ shouldFail?: boolean }>,
+		step: WorkflowStep
+	) {
+		const prepared = await step.do("prepare", async () => {
+			return { preparedAt: new Date().toISOString() };
+		});
+
+		const result = await step.do(
+			"risky",
+			{
+				retries: { limit: 0, delay: "1 second", backoff: "constant" },
+				timeout: "10 seconds",
+			},
+			async () => {
+				if (event.payload?.shouldFail) {
+					throw new Error(
+						"Intentional failure — test restart-from-step on errored instance"
+					);
+				}
+				return { riskyResult: "success", preparedAt: prepared.preparedAt };
+			}
+		);
+
+		return await step.do("cleanup", async () => {
+			return { ...result, cleanedUpAt: new Date().toISOString() };
+		});
+	}
+}
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -41,6 +176,20 @@ export default {
 				const doId = env.DO.idFromName(id);
 				const stub = env.DO.get(doId);
 				return stub.fetch(request);
+			}
+
+			// Workflow routes
+			case "/workflow/kitchen-sink": {
+				const label = url.searchParams.get("label") ?? "explorer-test";
+				const instance = await env.KITCHEN_SINK.create({ params: { label } });
+				return Response.json({ id: instance.id, status: "created" });
+			}
+			case "/workflow/error-recovery": {
+				const shouldFail = url.searchParams.get("fail") !== "false";
+				const instance = await env.ERROR_RECOVERY.create({
+					params: { shouldFail },
+				});
+				return Response.json({ id: instance.id, status: "created" });
 			}
 		}
 		return new Response("Hello World!");

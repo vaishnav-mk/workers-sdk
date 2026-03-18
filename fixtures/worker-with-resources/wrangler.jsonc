@@ -35,4 +35,16 @@
 			"tag": "v1",
 		},
 	],
+	"workflows": [
+		{
+			"name": "kitchen-sink",
+			"binding": "KITCHEN_SINK",
+			"class_name": "KitchenSink",
+		},
+		{
+			"name": "error-recovery",
+			"binding": "ERROR_RECOVERY",
+			"class_name": "ErrorRecovery",
+		},
+	],
 }
