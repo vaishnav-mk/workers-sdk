@@ -1242,3 +1242,150 @@ describe("Engine", () => {
 		});
 	});
 });
+
+// RPC-stubbed rollback fns can't reliably mutate test-scope closures —
+// assert via engine log events instead.
+describe("Rollback", () => {
+	function NRE(msg: string): Error {
+		const e = new Error(msg);
+		e.name = "NonRetryableError";
+		return e;
+	}
+
+	async function readLogsAfter(
+		stub: { readLogs(): Promise<EngineLogs> | EngineLogs },
+		predicate: (logs: EngineLogs) => boolean,
+		timeout = 5000
+	): Promise<EngineLogs> {
+		await vi.waitUntil(
+			async () => predicate((await stub.readLogs()) as EngineLogs),
+			{ timeout }
+		);
+		return (await stub.readLogs()) as EngineLogs;
+	}
+
+	function targetsOf(
+		logs: EngineLogs,
+		event: InstanceEvent
+	): (string | null)[] {
+		return logs.logs.filter((l) => l.event === event).map((l) => l.target);
+	}
+
+	function countOf(logs: EngineLogs, event: InstanceEvent): number {
+		return logs.logs.filter((l) => l.event === event).length;
+	}
+
+	// @ts-expect-error -- step.do's trailing rollback arg lands with workerd PR #6330
+	const noop = async () => {};
+
+	it("runs rollback fns in LIFO order on workflow failure", async ({
+		expect,
+	}) => {
+		const stub = await runWorkflow("RB-LIFO", async (_e, step) => {
+			await step.do("step-1", async () => "out-1", noop);
+			await step.do("step-2", async () => "out-2", noop);
+			await step.do("step-3", async () => "out-3", noop);
+			throw NRE("boom");
+		});
+		const logs = await readLogsAfter(stub, (l) =>
+			l.logs.some((r) => r.event === InstanceEvent.ROLLBACK_COMPLETE)
+		);
+		expect(targetsOf(logs, InstanceEvent.ROLLBACK_STEP_SUCCESS)).toEqual([
+			"step-3-1",
+			"step-2-1",
+			"step-1-1",
+		]);
+		expect(countOf(logs, InstanceEvent.ROLLBACK_FAILED)).toBe(0);
+	});
+
+	it("only runs rollbacks for steps with a registered fn", async ({
+		expect,
+	}) => {
+		const stub = await runWorkflow("RB-PARTIAL", async (_e, step) => {
+			await step.do("plain-step", async () => "v1");
+			await step.do("step-with-rollback", async () => "v2", noop);
+			throw NRE("boom");
+		});
+		const logs = await readLogsAfter(stub, (l) =>
+			l.logs.some((r) => r.event === InstanceEvent.ROLLBACK_COMPLETE)
+		);
+		expect(targetsOf(logs, InstanceEvent.ROLLBACK_STEP_SUCCESS)).toEqual([
+			"step-with-rollback-1",
+		]);
+		expect(
+			logs.logs.find((l) => l.event === InstanceEvent.ROLLBACK_START)?.metadata
+		).toMatchObject({ totalSteps: 1 });
+	});
+
+	it("stops at the first failing rollback and logs ROLLBACK_FAILED", async ({
+		expect,
+	}) => {
+		const stub = await runWorkflow("RB-FAILS", async (_e, step) => {
+			await step.do("step-1", async () => "v1", noop);
+			await step.do(
+				"step-2",
+				async () => "v2",
+				// @ts-expect-error -- trailing rollback arg, public type lands with workerd PR #6330
+				async () => {
+					throw new Error("rollback-boom");
+				}
+			);
+			await step.do("step-3", async () => "v3", noop);
+			throw NRE("boom");
+		});
+		const logs = await readLogsAfter(stub, (l) =>
+			l.logs.some((r) => r.event === InstanceEvent.ROLLBACK_FAILED)
+		);
+		expect(targetsOf(logs, InstanceEvent.ROLLBACK_STEP_SUCCESS)).toEqual([
+			"step-3-1",
+		]);
+		expect(targetsOf(logs, InstanceEvent.ROLLBACK_STEP_FAILURE)).toEqual([
+			"step-2-1",
+		]);
+		expect(countOf(logs, InstanceEvent.ROLLBACK_COMPLETE)).toBe(0);
+	});
+
+	it("does not run rollback when workflow succeeds", async ({ expect }) => {
+		const stub = await runWorkflow("RB-NOOP", async (_e, step) => {
+			await step.do("a", async () => "ok", noop);
+			return "done";
+		});
+		const logs = await readLogsAfter(stub, (l) =>
+			l.logs.some((r) => r.event === InstanceEvent.WORKFLOW_SUCCESS)
+		);
+		expect(countOf(logs, InstanceEvent.ROLLBACK_START)).toBe(0);
+	});
+
+	it("registers rollback for waitForEvent and fires it on failure", async ({
+		expect,
+	}) => {
+		const stub = await runWorkflow("RB-WAIT", async (_e, step) => {
+			await step.do("seed", async () => "seeded");
+			await step.waitForEvent(
+				"approval",
+				{ type: "approval", timeout: "1 minute" },
+				// @ts-expect-error -- trailing rollback arg, public type lands with workerd PR #6330
+				noop
+			);
+			throw NRE("boom");
+		});
+		await vi.waitUntil(
+			async () => {
+				const logs = (await stub.readLogs()) as EngineLogs;
+				return logs.logs.some((l) => l.event === InstanceEvent.WAIT_START);
+			},
+			{ timeout: 5000 }
+		);
+		await stub.receiveEvent({
+			type: "approval",
+			timestamp: new Date(),
+			payload: { ok: true },
+		});
+		const logs = await readLogsAfter(stub, (l) =>
+			l.logs.some((r) => r.event === InstanceEvent.ROLLBACK_COMPLETE)
+		);
+		expect(targetsOf(logs, InstanceEvent.ROLLBACK_STEP_SUCCESS)).toEqual([
+			"approval-1",
+		]);
+	});
+});

@@ -15,6 +15,7 @@ import {
 	WorkflowTimeoutError,
 } from "./lib/errors";
 import { calcRetryDuration } from "./lib/retries";
+import { ROLLBACK_CACHE_KEY_PREFIX } from "./lib/rollback";
 import {
 	cleanupPendingStreamOutput,
 	createReplayReadableStream,
@@ -33,6 +34,7 @@ import {
 import { MODIFIER_KEYS } from "./modifier";
 import type { Engine } from "./engine";
 import type { InstanceMetadata } from "./instance";
+import type { RollbackFn } from "./lib/rollback";
 import type { StreamOutputMeta } from "./lib/streams";
 import type {
 	WorkflowSleepDuration,
@@ -82,10 +84,16 @@ export class Context extends RpcTarget {
 	#counters: Map<string, number> = new Map();
 	#lifetimeStepCounter: number = 0;
 
+	#rollbackStep: { cacheKey: string } | undefined = undefined;
+
 	constructor(engine: Engine, state: DurableObjectState) {
 		super();
 		this.#engine = engine;
 		this.#state = state;
+	}
+
+	setRollbackStep(opts: { cacheKey: string } | undefined): void {
+		this.#rollbackStep = opts;
 	}
 
 	async #checkForPendingPause(): Promise<void> {
@@ -125,38 +133,62 @@ export class Context extends RpcTarget {
 
 	do(
 		name: string,
-		callback: (ctx: WorkflowStepContext) => Promise<unknown>
+		callback: (ctx: WorkflowStepContext) => Promise<unknown>,
+		rollbackFn?: RollbackFn,
+		rollbackConfig?: WorkflowStepConfig
 	): Promise<unknown>;
 	do(
 		name: string,
 		config: WorkflowStepConfig,
-		callback: (ctx: WorkflowStepContext) => Promise<unknown>
+		callback: (ctx: WorkflowStepContext) => Promise<unknown>,
+		rollbackFn?: RollbackFn,
+		rollbackConfig?: WorkflowStepConfig
 	): Promise<unknown>;
 
 	async do<T>(
 		name: string,
-		configOrCallback:
-			| WorkflowStepConfig
-			| ((ctx: WorkflowStepContext) => Promise<T>),
-		callback?: (ctx: WorkflowStepContext) => Promise<T>
+		...rest: unknown[]
 	): Promise<unknown | void | undefined> {
-		let closure: (ctx: WorkflowStepContext) => Promise<T>, stepConfig;
-		// If a user passes in a config, we'd like it to be the second arg so the callback is always last
-		if (callback) {
-			closure = callback;
-			stepConfig = configOrCallback as WorkflowStepConfig;
-		} else {
-			closure = configOrCallback as (ctx: WorkflowStepContext) => Promise<T>;
+		let closure: (ctx: WorkflowStepContext) => Promise<T>;
+		let stepConfig: WorkflowStepConfig;
+		let rollbackFn: RollbackFn | undefined;
+		let rollbackConfig: WorkflowStepConfig | undefined;
+
+		const first = rest[0];
+		if (typeof first === "function") {
+			closure = first as (ctx: WorkflowStepContext) => Promise<T>;
 			stepConfig = {};
+			rollbackFn = rest[1] as RollbackFn | undefined;
+			rollbackConfig = rest[2] as WorkflowStepConfig | undefined;
+		} else {
+			stepConfig = (first ?? {}) as WorkflowStepConfig;
+			closure = rest[1] as (ctx: WorkflowStepContext) => Promise<T>;
+			rollbackFn = rest[2] as RollbackFn | undefined;
+			rollbackConfig = rest[3] as WorkflowStepConfig | undefined;
 		}
 
-		this.#lifetimeStepCounter++;
+		const isRollback = this.#rollbackStep !== undefined;
+		const events = isRollback
+			? {
+					start: InstanceEvent.ROLLBACK_STEP_START,
+					success: InstanceEvent.ROLLBACK_STEP_SUCCESS,
+					failure: InstanceEvent.ROLLBACK_STEP_FAILURE,
+				}
+			: {
+					start: InstanceEvent.STEP_START,
+					success: InstanceEvent.STEP_SUCCESS,
+					failure: InstanceEvent.STEP_FAILURE,
+				};
 
-		const stepLimit = this.#engine.stepLimit;
-		if (this.#lifetimeStepCounter > stepLimit) {
-			throw new WorkflowFatalError(
-				`The limit of ${stepLimit} steps has been reached. This limit can be changed in your worker configuration.`
-			);
+		if (!isRollback) {
+			this.#lifetimeStepCounter++;
+
+			const stepLimit = this.#engine.stepLimit;
+			if (this.#lifetimeStepCounter > stepLimit) {
+				throw new WorkflowFatalError(
+					`The limit of ${stepLimit} steps has been reached. This limit can be changed in your worker configuration.`
+				);
+			}
 		}
 
 		if (!isValidStepName(name)) {
@@ -188,15 +220,24 @@ export class Context extends RpcTarget {
 			},
 		};
 
-		const hash = await computeHash(name);
-		const count = this.#getCount("run-" + name);
-		const cacheKey = `${hash}-${count}`;
+		let cacheKey: string;
+		let count: number;
+		let stepNameWithCounter: string;
+		if (isRollback) {
+			cacheKey = `${ROLLBACK_CACHE_KEY_PREFIX}${this.#rollbackStep!.cacheKey}`;
+			count = 1;
+			stepNameWithCounter = name;
+		} else {
+			const hash = await computeHash(name);
+			count = this.#getCount("run-" + name);
+			cacheKey = `${hash}-${count}`;
+			stepNameWithCounter = `${name}-${count}`;
+		}
 
 		const valueKey = `${cacheKey}-value`;
 		const streamMetaKey = getStreamOutputMetaKey(cacheKey);
 		const configKey = `${cacheKey}-config`;
 		const errorKey = `${cacheKey}-error`;
-		const stepNameWithCounter = `${name}-${count}`;
 		const stepStateKey = `${cacheKey}-metadata`;
 		const retryDelayDisableKey = `${MODIFIER_KEYS.DISABLE_RETRY_DELAY}${valueKey}`;
 
@@ -324,14 +365,9 @@ export class Context extends RpcTarget {
 			await this.#engine.timeoutHandler.acquire(this.#engine);
 
 			if (stepState.attemptedCount == 0) {
-				this.#engine.writeLog(
-					InstanceEvent.STEP_START,
-					cacheKey,
-					stepNameWithCounter,
-					{
-						config,
-					}
-				);
+				this.#engine.writeLog(events.start, cacheKey, stepNameWithCounter, {
+					config,
+				});
 			} else {
 				// in case the engine dies while retrying and wakes up before the retry period
 				const priorityQueueHash = `${cacheKey}-${stepState.attemptedCount}`;
@@ -557,7 +593,7 @@ export class Context extends RpcTarget {
 							}
 						);
 						this.#engine.writeLog(
-							InstanceEvent.STEP_FAILURE,
+							events.failure,
 							cacheKey,
 							stepNameWithCounter,
 							{}
@@ -589,7 +625,7 @@ export class Context extends RpcTarget {
 							}
 						);
 						this.#engine.writeLog(
-							InstanceEvent.STEP_FAILURE,
+							events.failure,
 							cacheKey,
 							stepNameWithCounter,
 							{}
@@ -624,7 +660,7 @@ export class Context extends RpcTarget {
 							}
 						);
 						this.#engine.writeLog(
-							InstanceEvent.STEP_FAILURE,
+							events.failure,
 							cacheKey,
 							stepNameWithCounter,
 							{}
@@ -716,7 +752,7 @@ export class Context extends RpcTarget {
 						}
 					);
 					this.#engine.writeLog(
-						InstanceEvent.STEP_FAILURE,
+						events.failure,
 						cacheKey,
 						stepNameWithCounter,
 						{}
@@ -812,7 +848,7 @@ export class Context extends RpcTarget {
 						// Best-effort cleanup
 					}
 					this.#engine.writeLog(
-						InstanceEvent.STEP_FAILURE,
+						events.failure,
 						cacheKey,
 						stepNameWithCounter,
 						{}
@@ -823,18 +859,22 @@ export class Context extends RpcTarget {
 				}
 			}
 
-			this.#engine.writeLog(
-				InstanceEvent.STEP_SUCCESS,
-				cacheKey,
-				stepNameWithCounter,
-				{
-					// TODO (WOR-86): Add limits, figure out serialization
-					result: lastStreamMeta ? undefined : result,
-					...(lastStreamMeta && {
-						streamOutput: { cacheKey, meta: lastStreamMeta },
-					}),
-				}
-			);
+			this.#engine.writeLog(events.success, cacheKey, stepNameWithCounter, {
+				// TODO (WOR-86): Add limits, figure out serialization
+				result: lastStreamMeta ? undefined : result,
+				...(lastStreamMeta && {
+					streamOutput: { cacheKey, meta: lastStreamMeta },
+				}),
+			});
+			if (rollbackFn && !isRollback) {
+				this.#engine.registerRollbackFn(
+					cacheKey,
+					rollbackFn,
+					stepNameWithCounter,
+					result,
+					rollbackConfig
+				);
+			}
 			await this.#engine.timeoutHandler.release(this.#engine);
 			return result;
 		};
@@ -989,7 +1029,9 @@ export class Context extends RpcTarget {
 		options: {
 			type: string;
 			timeout?: string | number;
-		}
+		},
+		rollbackFn?: RollbackFn,
+		rollbackConfig?: WorkflowStepConfig
 	): Promise<WorkflowStepEvent<T>> {
 		if (!options.timeout) {
 			options.timeout = "24 hours";
@@ -1175,6 +1217,15 @@ export class Context extends RpcTarget {
 			raceResult as Event
 		);
 		await this.#state.storage.put(waitForEventKey, raceResult);
+		if (rollbackFn) {
+			this.#engine.registerRollbackFn(
+				cacheKey,
+				rollbackFn,
+				waitForEventNameWithCounter,
+				raceResult,
+				rollbackConfig
+			);
+		}
 
 		return raceResult as WorkflowStepEvent<T>;
 	}
