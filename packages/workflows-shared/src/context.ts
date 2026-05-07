@@ -15,7 +15,11 @@ import {
 	WorkflowTimeoutError,
 } from "./lib/errors";
 import { calcRetryDuration } from "./lib/retries";
-import { ROLLBACK_CACHE_KEY_PREFIX } from "./lib/rollback";
+import {
+	disposeRollbackStub,
+	dupRollbackStub,
+	ROLLBACK_CACHE_KEY_PREFIX,
+} from "./lib/rollback";
 import {
 	cleanupPendingStreamOutput,
 	createReplayReadableStream,
@@ -75,6 +79,32 @@ export type WorkflowStepContext = {
 	attempt: number;
 	config: ResolvedStepConfig;
 };
+
+type ContextWithWorkflowError = {
+	do<T>(
+		name: string,
+		callback: (ctx: WorkflowStepContext) => Promise<T>,
+		explicitRollbackFn?: RollbackFn,
+		explicitRollbackConfig?: WorkflowStepConfig
+	): Promise<unknown | void | undefined>;
+	do<T>(
+		name: string,
+		config: WorkflowStepConfig,
+		callback: (ctx: WorkflowStepContext) => Promise<T>,
+		explicitRollbackFn?: RollbackFn,
+		explicitRollbackConfig?: WorkflowStepConfig
+	): Promise<unknown | void | undefined>;
+	waitForEvent<T>(
+		name: string,
+		options: {
+			type: string;
+			timeout?: string | number;
+		},
+		explicitRollbackFn?: RollbackFn,
+		explicitRollbackConfig?: WorkflowStepConfig
+	): Promise<WorkflowStepEvent<T>>;
+	[Symbol.dispose]?: () => void;
+};
 const PAUSE_DATETIME = "PAUSE_DATETIME";
 
 export class Context extends RpcTarget {
@@ -94,6 +124,87 @@ export class Context extends RpcTarget {
 
 	setRollbackStep(opts: { cacheKey: string } | undefined): void {
 		this.#rollbackStep = opts;
+	}
+
+	onWorkflowError(
+		rollbackFn: RollbackFn,
+		rollbackConfig?: WorkflowStepConfig
+	): ContextWithWorkflowError {
+		if (typeof rollbackFn !== "function") {
+			throw new WorkflowFatalError("onWorkflowError() expects a function");
+		}
+
+		const context = this;
+		const fn = dupRollbackStub(rollbackFn);
+		const rejectExplicitRollback = (explicit?: RollbackFn) => {
+			if (explicit !== undefined) {
+				disposeRollbackStub(fn);
+				throw new WorkflowFatalError(
+					"Cannot combine onWorkflowError() with an explicit rollback function"
+				);
+			}
+		};
+
+		return {
+			async do<T>(name: string, ...rest: unknown[]) {
+				try {
+					const first = rest[0];
+					if (typeof first === "function") {
+						const explicitRollbackFn = rest[1] as RollbackFn | undefined;
+						const explicitRollbackConfig = rest[2] as
+							| WorkflowStepConfig
+							| undefined;
+						rejectExplicitRollback(explicitRollbackFn);
+						return await context.do(
+							name,
+							first as (ctx: WorkflowStepContext) => Promise<T>,
+							fn,
+							explicitRollbackConfig ?? rollbackConfig
+						);
+					}
+
+					const callback = rest[1] as (ctx: WorkflowStepContext) => Promise<T>;
+					const explicitRollbackFn = rest[2] as RollbackFn | undefined;
+					const explicitRollbackConfig = rest[3] as
+						| WorkflowStepConfig
+						| undefined;
+					rejectExplicitRollback(explicitRollbackFn);
+					return await context.do(
+						name,
+						(first ?? {}) as WorkflowStepConfig,
+						callback,
+						fn,
+						explicitRollbackConfig ?? rollbackConfig
+					);
+				} finally {
+					disposeRollbackStub(fn);
+				}
+			},
+
+			async waitForEvent<T>(
+				name: string,
+				options: {
+					type: string;
+					timeout?: string | number;
+				},
+				explicitRollbackFn?: RollbackFn,
+				explicitRollbackConfig?: WorkflowStepConfig
+			) {
+				rejectExplicitRollback(explicitRollbackFn);
+				try {
+					return await context.waitForEvent<T>(
+						name,
+						options,
+						fn,
+						explicitRollbackConfig ?? rollbackConfig
+					);
+				} finally {
+					disposeRollbackStub(fn);
+				}
+			},
+
+			[Symbol.dispose]: () => disposeRollbackStub(fn),
+		};
 	}
 
 	async #checkForPendingPause(): Promise<void> {

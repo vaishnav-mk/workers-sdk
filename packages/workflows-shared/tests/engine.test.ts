@@ -13,6 +13,7 @@ import type {
 	DatabaseWorkflow,
 	EngineLogs,
 } from "../src/engine";
+import type { RollbackFn } from "../src/lib/rollback";
 import type { WorkflowStep } from "cloudflare:workers";
 
 afterEach(async () => {
@@ -1275,16 +1276,27 @@ describe("Rollback", () => {
 		return logs.logs.filter((l) => l.event === event).length;
 	}
 
-	// @ts-expect-error -- step.do's trailing rollback arg lands with workerd PR #6330
-	const noop = async () => {};
+	type WorkflowStepWithOnWorkflowError = WorkflowStep & {
+		onWorkflowError(rollbackFn: RollbackFn): WorkflowStep;
+	};
+
+	function withOnWorkflowError(
+		step: WorkflowStep
+	): WorkflowStepWithOnWorkflowError {
+		return step as WorkflowStepWithOnWorkflowError;
+	}
+
+	const noop: RollbackFn = async () => {};
+	const withRollback = (step: WorkflowStep, fn: RollbackFn = noop) =>
+		withOnWorkflowError(step).onWorkflowError(fn);
 
 	it("runs rollback fns in LIFO order on workflow failure", async ({
 		expect,
 	}) => {
 		const stub = await runWorkflow("RB-LIFO", async (_e, step) => {
-			await step.do("step-1", async () => "out-1", noop);
-			await step.do("step-2", async () => "out-2", noop);
-			await step.do("step-3", async () => "out-3", noop);
+			await withRollback(step).do("step-1", async () => "out-1");
+			await withRollback(step).do("step-2", async () => "out-2");
+			await withRollback(step).do("step-3", async () => "out-3");
 			throw NRE("boom");
 		});
 		const logs = await readLogsAfter(stub, (l) =>
@@ -1303,7 +1315,8 @@ describe("Rollback", () => {
 	}) => {
 		const stub = await runWorkflow("RB-PARTIAL", async (_e, step) => {
 			await step.do("plain-step", async () => "v1");
-			await step.do("step-with-rollback", async () => "v2", noop);
+			await withRollback(step).do("step-with-rollback", async () => "v2");
+			await step.do("plain-step-after", async () => "v3");
 			throw NRE("boom");
 		});
 		const logs = await readLogsAfter(stub, (l) =>
@@ -1321,16 +1334,11 @@ describe("Rollback", () => {
 		expect,
 	}) => {
 		const stub = await runWorkflow("RB-FAILS", async (_e, step) => {
-			await step.do("step-1", async () => "v1", noop);
-			await step.do(
-				"step-2",
-				async () => "v2",
-				// @ts-expect-error -- trailing rollback arg, public type lands with workerd PR #6330
-				async () => {
-					throw new Error("rollback-boom");
-				}
-			);
-			await step.do("step-3", async () => "v3", noop);
+			await withRollback(step).do("step-1", async () => "v1");
+			await withRollback(step, async () => {
+				throw new Error("rollback-boom");
+			}).do("step-2", async () => "v2");
+			await withRollback(step).do("step-3", async () => "v3");
 			throw NRE("boom");
 		});
 		const logs = await readLogsAfter(stub, (l) =>
@@ -1347,7 +1355,7 @@ describe("Rollback", () => {
 
 	it("does not run rollback when workflow succeeds", async ({ expect }) => {
 		const stub = await runWorkflow("RB-NOOP", async (_e, step) => {
-			await step.do("a", async () => "ok", noop);
+			await withRollback(step).do("a", async () => "ok");
 			return "done";
 		});
 		const logs = await readLogsAfter(stub, (l) =>
@@ -1361,12 +1369,10 @@ describe("Rollback", () => {
 	}) => {
 		const stub = await runWorkflow("RB-WAIT", async (_e, step) => {
 			await step.do("seed", async () => "seeded");
-			await step.waitForEvent(
-				"approval",
-				{ type: "approval", timeout: "1 minute" },
-				// @ts-expect-error -- trailing rollback arg, public type lands with workerd PR #6330
-				noop
-			);
+			await withRollback(step).waitForEvent("approval", {
+				type: "approval",
+				timeout: "1 minute",
+			});
 			throw NRE("boom");
 		});
 		await vi.waitUntil(
